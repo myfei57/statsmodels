@@ -164,6 +164,13 @@ New functions and methods
   confidence interval of the difference of two paired proportions, using
   Newcombe's method 10 (the default) or the Wald interval. :issue:`10374`,
   :pr:`10375`
+- Add :func:`~statsmodels.stats.proportion.proportion_simultaneous_confint`
+  for Bonferroni simultaneous Clopper-Pearson confidence intervals of a
+  binomial proportion at a prespecified finite number of analysis times.
+  Per-look error probabilities are allocated equally by default or by the
+  caller, and the result also contains the cumulative intersection of the
+  intervals, with empty intersections explicitly marked. The function is
+  available from ``statsmodels.stats.api``.
 - Add ``RollingRegressionResults.get_resid`` to compute the residuals of
   ``RollingOLS`` and ``RollingWLS``, optionally as one-step ahead prediction
   errors with ``out_of_sample=True``. :issue:`7521`, :pr:`10462`

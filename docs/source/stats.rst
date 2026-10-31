@@ -538,6 +538,8 @@ proportions that can be used with NormalIndPower.
 
    proportion_confint
    proportion_effectsize
+   proportion_simultaneous_confint
+   SimultaneousProportionConfintResult
 
    binom_test
    binom_test_reject_interval

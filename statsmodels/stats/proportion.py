@@ -324,6 +324,245 @@ def proportion_confint(
     return ci_low, ci_upp
 
 
+class SimultaneousProportionConfintResult(NamedTuple):
+    """
+    Result of :func:`proportion_simultaneous_confint`.
+
+    Parameters
+    ----------
+    ci_low : ndarray
+        Lower limits of the per-look Clopper-Pearson intervals, in the order
+        of the input.
+    ci_upp : ndarray
+        Upper limits of the per-look Clopper-Pearson intervals, in the order
+        of the input.
+    intersection_low : ndarray
+        Lower limit of the intersection of the intervals of all looks up to
+        and including the current look. The entry is ``nan`` at looks where
+        the cumulative intersection is empty, see `intersection_empty`.
+    intersection_upp : ndarray
+        Upper limit of the intersection of the intervals of all looks up to
+        and including the current look. The entry is ``nan`` at looks where
+        the cumulative intersection is empty, see `intersection_empty`.
+    intersection_empty : ndarray of bool
+        ``True`` at a look if the intersection of the intervals of all looks
+        up to and including that look is empty. If the intersection becomes
+        empty at a look, it remains empty at every later look.
+    alloc : ndarray
+        Per-look error probabilities used to compute the intervals.
+    """
+
+    ci_low: np.ndarray
+    ci_upp: np.ndarray
+    intersection_low: np.ndarray
+    intersection_upp: np.ndarray
+    intersection_empty: np.ndarray
+    alloc: np.ndarray
+
+
+def proportion_simultaneous_confint(count, nobs, alpha=0.05, alloc=None):
+    """
+    Simultaneous Clopper-Pearson intervals at predetermined analysis times
+
+    Bonferroni simultaneous confidence intervals for a single binomial
+    proportion from cumulative binomial counts observed at a fixed,
+    prespecified number of analysis times ("looks").
+
+    Parameters
+    ----------
+    count : array_like of int, 1-D
+        Cumulative number of successes at each look, in the order of the
+        looks. Values must be non-decreasing, and the number of new
+        successes between two consecutive looks must not exceed the number
+        of new trials.
+    nobs : array_like of int, 1-D
+        Cumulative number of trials at each look, in the order of the
+        looks. Values must be positive and strictly increasing. These
+        cumulative sample sizes, i.e. the analysis plan, must be fixed in
+        advance, before the data are observed.
+    alpha : float in (0, 1), optional
+        Total error probability of the family of intervals. The joint
+        coverage probability of all intervals is at least ``1 - alpha``.
+        Default is 0.05.
+    alloc : array_like of float, 1-D, optional
+        Positive error probability allocated to each look, in the order of
+        the looks. Every entry must be positive and finite, and the sum of
+        the entries must not exceed `alpha`. If not given, the error
+        probability is split equally, that is every look receives
+        ``alpha / len(nobs)``.
+
+    Returns
+    -------
+    res : SimultaneousProportionConfintResult
+        Named tuple with the individual interval of each look
+        (``ci_low`` and ``ci_upp``), the intersection of all intervals up
+        to and including each look (``intersection_low`` and
+        ``intersection_upp``), a boolean array ``intersection_empty`` that
+        marks looks at which this cumulative intersection is empty, and
+        the per-look error probabilities ``alloc``. The intersection
+        bounds are ``nan`` at and after a look with an empty intersection.
+
+    Raises
+    ------
+    ValueError
+        If `alpha` is not in the open interval ``(0, 1)``; if `count` or
+        `nobs` do not contain finite integer values; if `nobs` is empty,
+        not positive or not strictly increasing; if `count` is empty,
+        negative, decreases or adds more successes than new trials; if
+        `count` and `nobs` differ in length; or if `alloc` has the wrong
+        length, non-finite or non-positive entries or a sum larger than
+        `alpha`.
+
+    Notes
+    -----
+    At look :math:`i`, a two-sided Clopper-Pearson ("beta") interval at
+    level :math:`1 - \\alpha_i` is computed from the cumulative count,
+    where :math:`\\alpha_i` is the error probability allocated to that
+    look. By the Bonferroni inequality, the probability that every
+    interval covers the true proportion :math:`p` is at least
+
+    .. math::
+
+       1 - \\sum_{i=1}^{m} \\alpha_i \\geq 1 - \\alpha.
+
+    The joint coverage statement relies on all of the following:
+
+    - the number of looks :math:`m` and the cumulative sample sizes
+      `nobs` are determined *before* the data are observed, so that the
+      family consists of a finite, prespecified set of intervals;
+    - at every look the cumulative count has a binomial distribution
+      :math:`\\operatorname{Binomial}(n_i, p)`, which assumes independent
+      Bernoulli trials with a common, constant success probability
+      :math:`p`;
+    - the intervals are computed for exactly the planned looks.
+
+    The intervals of the different looks use overlapping data and are not
+    nested. Their intersection can therefore be empty, in particular when
+    the observed proportions differ strongly between looks. An empty
+    intersection is marked in ``intersection_empty`` and returned with
+    ``nan`` bounds; no interval is fabricated in that case. Once the
+    cumulative intersection is empty at a look, it stays empty at every
+    later look.
+
+    This function does **not** return an anytime-valid confidence sequence
+    and the intervals are not valid for arbitrary, data-dependent analysis
+    times. Adding unplanned looks, choosing the sample size of a later
+    look from earlier results, or stopping early based on the observed
+    intervals invalidates the Bonferroni coverage guarantee.
+
+    As the Clopper-Pearson interval itself, the family of intervals is
+    conservative. At a look with zero successes or with only successes,
+    the boundary behavior described in :func:`proportion_confint` applies
+    to the interval of that look.
+
+    See Also
+    --------
+    proportion_confint
+    multinomial_proportions_confint
+
+    References
+    ----------
+    .. [*] Clopper, C. J. and Pearson, E. S. (1934). The use of confidence
+           or fiducial limits illustrated in the case of the binomial.
+           Biometrika, 26(4), 404-413.
+    .. [*] Bonferroni, C. E. (1936). Teoria statistica delle classi e
+           calcolo delle probabilita. Pubblicazioni del R Istituto
+           Superiore di Scienze Economiche e Commerciali di Firenze, 8,
+           3-62.
+    """
+    alpha = float_like(alpha, "alpha")
+    if not 0 < alpha < 1:
+        raise ValueError(f"alpha must be in the range (0, 1), got {alpha}")
+
+    count_a = array_like(count, "count", dtype=None, ndim=1)
+    nobs_a = array_like(nobs, "nobs", dtype=None, ndim=1)
+
+    def _check_integer(x, name):
+        if np.issubdtype(x.dtype, np.integer):
+            return x.astype(np.int64)
+        xf = x.astype(np.float64)
+        if not np.all(np.isfinite(xf)):
+            raise ValueError(f"{name} must contain finite integer values")
+        xi = np.rint(xf)
+        if np.any(xi != xf):
+            raise ValueError(f"{name} must contain integer values")
+        return xi.astype(np.int64)
+
+    count_i = _check_integer(count_a, "count")
+    nobs_i = _check_integer(nobs_a, "nobs")
+
+    if count_i.size != nobs_i.size:
+        raise ValueError(
+            "count and nobs must have the same length, got "
+            f"{count_i.size} and {nobs_i.size}"
+        )
+    k = nobs_i.size
+    if k < 1:
+        raise ValueError(
+            "at least one look is required, count and nobs must not be empty"
+        )
+    if np.any(nobs_i <= 0):
+        raise ValueError("nobs must be positive at every look")
+    if np.any(np.diff(nobs_i) <= 0):
+        raise ValueError("nobs must be strictly increasing")
+    if np.any(count_i < 0):
+        raise ValueError("count must be non-negative")
+    if np.any(np.diff(count_i) < 0):
+        raise ValueError("cumulative count must be non-decreasing")
+    if count_i[0] > nobs_i[0] or np.any(np.diff(count_i) > np.diff(nobs_i)):
+        raise ValueError(
+            "the cumulative count must not exceed the cumulative number of "
+            "trials: the number of new successes between two looks cannot "
+            "exceed the number of new trials"
+        )
+
+    if alloc is None:
+        alloc_a = np.full(k, alpha / k, dtype=np.float64)
+    else:
+        alloc_a = array_like(alloc, "alloc", dtype=np.float64, ndim=1)
+        if alloc_a.size != k:
+            raise ValueError(
+                f"alloc must have the same length as nobs, got {alloc_a.size} and {k}"
+            )
+        if np.any(~np.isfinite(alloc_a)):
+            raise ValueError("alloc must contain finite values")
+        if np.any(alloc_a <= 0):
+            raise ValueError("alloc must contain positive values")
+        # tolerance only guards against floating point rounding at alpha
+        tol = 1e-12 * max(1.0, abs(alpha))
+        if alloc_a.sum() > alpha + tol:
+            raise ValueError(
+                f"the sum of alloc must not exceed alpha, got {alloc_a.sum()} > {alpha}"
+            )
+
+    ci_low = np.empty(k, dtype=np.float64)
+    ci_upp = np.empty(k, dtype=np.float64)
+    for i in range(k):
+        lo, hi = proportion_confint(
+            int(count_i[i]),
+            int(nobs_i[i]),
+            alpha=float(alloc_a[i]),
+            method="beta",
+        )
+        ci_low[i] = lo
+        ci_upp[i] = hi
+
+    intersection_low = np.maximum.accumulate(ci_low)
+    intersection_upp = np.minimum.accumulate(ci_upp)
+    intersection_empty = intersection_low > intersection_upp
+    intersection_low[intersection_empty] = np.nan
+    intersection_upp[intersection_empty] = np.nan
+
+    return SimultaneousProportionConfintResult(
+        ci_low=ci_low,
+        ci_upp=ci_upp,
+        intersection_low=intersection_low,
+        intersection_upp=intersection_upp,
+        intersection_empty=intersection_empty,
+        alloc=alloc_a,
+    )
+
+
 def multinomial_proportions_confint(counts, alpha=0.05, method="goodman"):
     """
     Confidence intervals for multinomial proportions

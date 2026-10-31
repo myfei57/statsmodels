@@ -2222,3 +2222,226 @@ def test_samplesize_confint_proportion_broadcast():
         for j, hj in enumerate(h):
             expected = smprop.samplesize_confint_proportion(qi, hj)
             assert_allclose(res[i, j], expected, rtol=1e-13)
+
+
+@pytest.mark.parametrize(
+    "count, nobs, alpha",
+    [
+        (7, 20, 0.05),
+        (0, 15, 0.1),
+        (30, 30, 0.01),
+        (1, 1, 0.05),
+    ],
+)
+def test_simultaneous_confint_single_look(count, nobs, alpha):
+    # with one look the interval must be exactly the beta interval and the
+    # cumulative intersection must be that interval
+    res = smprop.proportion_simultaneous_confint(count, nobs, alpha=alpha)
+    assert isinstance(res, smprop.SimultaneousProportionConfintResult)
+    low, upp = proportion_confint(count, nobs, alpha=alpha, method="beta")
+    assert_allclose(res.ci_low, [low])
+    assert_allclose(res.ci_upp, [upp])
+    assert_allclose(res.intersection_low, [low])
+    assert_allclose(res.intersection_upp, [upp])
+    assert_equal(res.intersection_empty, np.array([False]))
+    assert res.intersection_empty.dtype == bool
+    assert_allclose(res.alloc, [alpha])
+
+
+def _beta_intervals(count, nobs, alloc):
+    # per-look Clopper-Pearson intervals computed independently
+    lows, upps = [], []
+    for c, n, a in zip(count, nobs, alloc, strict=True):
+        low, upp = proportion_confint(c, n, alpha=a, method="beta")
+        lows.append(low)
+        upps.append(upp)
+    return np.array(lows), np.array(upps)
+
+
+def test_simultaneous_confint_default_equal_allocation():
+    count = [4, 12, 23]
+    nobs = [10, 25, 50]
+    alpha = 0.06
+    alloc = np.full(len(count), alpha / len(count))
+
+    res = smprop.proportion_simultaneous_confint(count, nobs, alpha=alpha)
+    assert_allclose(res.alloc, alloc)
+
+    lows, upps = _beta_intervals(count, nobs, alloc)
+    assert_allclose(res.ci_low, lows)
+    assert_allclose(res.ci_upp, upps)
+    assert_allclose(res.intersection_low, np.maximum.accumulate(lows))
+    assert_allclose(res.intersection_upp, np.minimum.accumulate(upps))
+    assert_equal(res.intersection_empty, np.zeros(3, dtype=bool))
+
+
+@pytest.mark.parametrize(
+    "alloc, alpha",
+    [
+        ([0.01, 0.02, 0.02], 0.05),  # sum equals alpha
+        ([0.01, 0.01, 0.01], 0.10),  # sum is strictly below alpha
+    ],
+)
+def test_simultaneous_confint_unequal_allocation(alloc, alpha):
+    count = [3, 9, 14]
+    nobs = [10, 20, 40]
+
+    res = smprop.proportion_simultaneous_confint(count, nobs, alpha=alpha, alloc=alloc)
+    assert_allclose(res.alloc, np.asarray(alloc))
+
+    lows, upps = _beta_intervals(count, nobs, alloc)
+    assert_allclose(res.ci_low, lows)
+    assert_allclose(res.ci_upp, upps)
+    assert_allclose(res.intersection_low, np.maximum.accumulate(lows))
+    assert_allclose(res.intersection_upp, np.minimum.accumulate(upps))
+    assert not res.intersection_empty.any()
+
+
+def test_simultaneous_confint_all_success_and_all_failure():
+    nobs = [10, 20, 40]
+
+    # all failures: lower limits are zero
+    count_fail = [0, 0, 0]
+    res_fail = smprop.proportion_simultaneous_confint(count_fail, nobs, alpha=0.05)
+    lows, upps = _beta_intervals(count_fail, nobs, [0.05 / 3] * 3)
+    assert_allclose(res_fail.ci_low, np.zeros(3))
+    assert_allclose(res_fail.ci_upp, upps)
+    assert_allclose(res_fail.intersection_low, np.zeros(3))
+    assert_allclose(res_fail.intersection_upp, np.minimum.accumulate(upps))
+    assert_equal(res_fail.intersection_empty, np.zeros(3, dtype=bool))
+
+    # all successes: upper limits are one
+    count_succ = list(nobs)
+    res_succ = smprop.proportion_simultaneous_confint(count_succ, nobs)
+    lows, upps = _beta_intervals(count_succ, nobs, [0.05 / 3] * 3)
+    assert_allclose(res_succ.ci_low, lows)
+    assert_allclose(res_succ.ci_upp, np.ones(3))
+    assert_allclose(res_succ.intersection_low, np.maximum.accumulate(lows))
+    assert_allclose(res_succ.intersection_upp, np.ones(3))
+    assert_equal(res_succ.intersection_empty, np.zeros(3, dtype=bool))
+
+
+def test_simultaneous_confint_cumulative_intersection_nonempty():
+    # zero successes at the first look, half successes at the second:
+    # the intervals touch but still overlap
+    count, nobs = [0, 10], [10, 20]
+    res = smprop.proportion_simultaneous_confint(count, nobs, alpha=0.05)
+    lows, upps = _beta_intervals(count, nobs, [0.025, 0.025])
+    assert lows[1] <= upps[0]  # case really has a non-empty intersection
+    assert_allclose(res.ci_low, lows)
+    assert_allclose(res.ci_upp, upps)
+    assert_allclose(res.intersection_low, [lows[0], max(lows)])
+    assert_allclose(res.intersection_upp, [upps[0], min(upps)])
+    assert_equal(res.intersection_empty, [False, False])
+
+
+def test_simultaneous_confint_empty_intersection():
+    # strong inconsistency between looks: no successes early, many later
+    count, nobs = [0, 60], [10, 110]
+    lows, upps = _beta_intervals(count, nobs, [0.025, 0.025])
+    assert lows[1] > upps[0]  # the per-look intervals really are disjoint
+
+    res = smprop.proportion_simultaneous_confint(count, nobs, alpha=0.05)
+    # individual intervals are still returned unchanged
+    assert_allclose(res.ci_low, lows)
+    assert_allclose(res.ci_upp, upps)
+    # first intersection is the first interval, second is empty and marked
+    assert res.intersection_low[0] == lows[0]
+    assert res.intersection_upp[0] == upps[0]
+    assert_equal(res.intersection_empty, [False, True])
+    assert np.isnan(res.intersection_low[1])
+    assert np.isnan(res.intersection_upp[1])
+
+    # an empty cumulative intersection stays empty at all later looks
+    res3 = smprop.proportion_simultaneous_confint(
+        [0, 60, 65], [10, 110, 120], alpha=0.05
+    )
+    assert_equal(res3.intersection_empty, [False, True, True])
+    assert np.isnan(res3.intersection_low[1:]).all()
+    assert np.isnan(res3.intersection_upp[1:]).all()
+
+
+@pytest.mark.parametrize(
+    "count, nobs, match",
+    [
+        ([1, 2], [10], "same length"),
+        ([], [], "at least one look"),
+        ([1], [0], "nobs must be positive"),
+        ([1], [-5], "nobs must be positive"),
+        ([1, 1], [10, 10], "strictly increasing"),
+        ([5, 4], [10, 20], "non-decreasing"),
+        ([9, 20], [10, 20], "must not exceed"),
+        ([11], [10], "must not exceed"),
+        ([-1], [10], "non-negative"),
+        ([1.5, 2], [10, 20], "integer values"),
+        ([1, 2], [10, 20.5], "integer values"),
+        ([1, np.nan], [10, 20], "finite integer"),
+    ],
+)
+def test_simultaneous_confint_invalid_counts_raises(count, nobs, match):
+    with pytest.raises(ValueError, match=match):
+        smprop.proportion_simultaneous_confint(count, nobs, alpha=0.05)
+
+
+@pytest.mark.parametrize("alpha", [0, 1, -0.05, 1.1, np.nan])
+def test_simultaneous_confint_invalid_alpha_raises(alpha):
+    with pytest.raises(ValueError, match="alpha must be in the range"):
+        smprop.proportion_simultaneous_confint([1, 2], [10, 20], alpha=alpha)
+
+
+@pytest.mark.parametrize(
+    "alloc, match",
+    [
+        ([0.025], "same length"),
+        ([0.0, 0.05], "positive"),
+        ([-0.01, 0.06], "positive"),
+        ([0.03, 0.03], "must not exceed"),
+        ([0.025, np.nan], "finite"),
+        ([0.025, np.inf], "finite"),
+    ],
+)
+def test_simultaneous_confint_invalid_alloc_raises(alloc, match):
+    with pytest.raises(ValueError, match=match):
+        smprop.proportion_simultaneous_confint(
+            [1, 2], [10, 20], alpha=0.05, alloc=alloc
+        )
+
+
+def test_simultaneous_confint_inputs_unchanged_and_ordered():
+    count = np.array([3, 3, 9])
+    nobs = np.array([10, 20, 40])
+    alloc = np.array([0.01, 0.02, 0.02])
+    count0, nobs0, alloc0 = count.copy(), nobs.copy(), alloc.copy()
+
+    res = smprop.proportion_simultaneous_confint(count, nobs, alpha=0.05, alloc=alloc)
+    assert_equal(count, count0)
+    assert_equal(nobs, nobs0)
+    assert_equal(alloc, alloc0)
+
+    # results are returned in input order, and integer-valued floats or
+    # pandas Series give the same result as integer arrays
+    expected_low, expected_upp = _beta_intervals(
+        count.tolist(), nobs.tolist(), alloc.tolist()
+    )
+    assert_allclose(res.ci_low, expected_low)
+    assert_allclose(res.ci_upp, expected_upp)
+
+    res_floats = smprop.proportion_simultaneous_confint(
+        count.astype(float), nobs.astype(float), alpha=0.05, alloc=alloc
+    )
+    assert_allclose(res_floats.ci_low, expected_low)
+    assert_allclose(res_floats.ci_upp, expected_upp)
+
+    res_pd = smprop.proportion_simultaneous_confint(
+        pd.Series(count), pd.Series(nobs), alpha=0.05, alloc=alloc
+    )
+    assert_allclose(res_pd.ci_low, expected_low)
+    assert_allclose(res_pd.ci_upp, expected_upp)
+
+
+def test_simultaneous_confint_available_from_api():
+    from statsmodels.stats.api import (
+        proportion_simultaneous_confint as api_func,
+    )
+
+    assert api_func is smprop.proportion_simultaneous_confint
