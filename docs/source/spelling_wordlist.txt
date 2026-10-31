@@ -615,6 +615,7 @@ SLS
 SPSS
 STL
 STLForecast
+STLForecastBacktestResults
 STLForecastResults
 SUR
 SVARProcess

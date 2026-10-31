@@ -201,6 +201,15 @@ New functions and methods
   ``one_sided=True``, the trend at time t only depends on the observations up
   to and including t. It is computed with the Kalman filter of the state space
   form of the HP filter. :issue:`6947`, :pr:`10588`
+- Add :meth:`~statsmodels.tsa.forecasting.stl.STLForecast.backtest` for
+  rolling-origin backtests. At every origin, the STL decomposition and the
+  underlying model are re-estimated using only the data available up to the
+  origin, so no future information is used. The method supports expanding and
+  fixed-length training windows, a gap between the training sample and the
+  validation interval, and dropping or keeping an incomplete final window.
+  The new ``STLForecastBacktestResults`` class returns the actual and forecast
+  values per origin and horizon, preserves the pandas time index, and reports
+  the MAE and RMSE by forecast step.
 - Add :func:`~statsmodels.stats.multicollinearity.vif`,
   :func:`~statsmodels.stats.multicollinearity.vif_ridge` and
   :func:`~statsmodels.stats.multicollinearity.collinear_index` for the

@@ -68,6 +68,27 @@ ds = Docstring(STL.fit.__doc__)
 _fit_params = ds.extract_parameters(["inner_iter", "outer_iter"])
 
 
+def _get_endog_index(endog: Any, nobs: int) -> pd.Index:
+    """Normalize the row labels of an endog object to a pandas index."""
+    index = getattr(endog, "index", pd.RangeIndex(nobs))
+    if not (
+        isinstance(index, (pd.DatetimeIndex, pd.PeriodIndex))
+        or is_int_index(index)
+    ):
+        try:
+            index = pd.to_datetime(index)
+        except ValueError:
+            index = pd.RangeIndex(nobs)
+    return index
+
+
+def _seasonal_forecast(seasonal: np.ndarray, steps: int) -> np.ndarray:
+    """Extend a single full seasonal cycle forward using a random walk."""
+    period = seasonal.shape[0]
+    seasonal = np.tile(seasonal, steps // period + ((steps % period) != 0))
+    return seasonal[:steps]
+
+
 @Substitution(stl_forecast_params=indent(_stl_forecast_params, "    "))
 class STLForecast:
     r"""
@@ -220,6 +241,334 @@ class STLForecast:
             )
         return STLForecastResults(stl, stl_fit, mod, res, self._endog)
 
+    def backtest(
+        self,
+        steps: int,
+        initial: int | DateLike,
+        *,
+        step: int = 1,
+        window: int | None = None,
+        gap: int = 0,
+        partial: str = "drop",
+        inner_iter: int | None = None,
+        outer_iter: int | None = None,
+        fit_kwargs: dict[str, Any] | None = None,
+        forecast_kwargs: dict[str, Any] | None = None,
+    ) -> STLForecastBacktestResults:
+        """
+        Rolling-origin backtest of the STL-based forecast
+
+        At every origin, a fresh ``STL`` decomposition is computed using
+        only the observations that are available up to the origin, and a
+        fresh copy of the underlying model is fit to the decomposed data.
+        The decomposition is never performed on the complete series, so
+        observations in the validation interval cannot leak into the fit
+        through the STL trend or seasonal component. This model instance
+        and any of its previously fitted results are not modified.
+
+        Parameters
+        ----------
+        steps : int
+            The forecast horizon, i.e. the number of validated
+            observations after the gap at each origin. The model is
+            always asked for ``gap + steps`` forecasts, and the first
+            ``gap`` forecasts are discarded.
+        initial : int or date-like
+            The length of the training sample at the first origin. If an
+            integer, the number of observations from the start of the
+            series. A date-like label (str, datetime, Timestamp or
+            Period) is interpreted as the label of the last training
+            observation, and so requires a date-indexed ``endog``.
+        step : int, optional
+            The number of observations between two consecutive origins.
+            Default is 1, which evaluates every origin.
+        window : int, optional
+            Fixed length of the (rolling) training window used at every
+            origin. If None (the default), the training sample is
+            expanding and contains all observations up to the origin.
+        gap : int, optional
+            The number of observations between the end of the training
+            sample and the beginning of the validation interval. The
+            model still forecasts ``gap + steps`` observations, and the
+            validation values are the final ``steps`` forecasts.
+            Default is 0.
+        partial : {"drop", "keep"}, optional
+            Whether to evaluate the final origin when its validation
+            interval extends beyond the observed sample. "drop"
+            (the default) skips origins without a complete validation
+            interval, while "keep" retains the observations that are
+            available.
+        inner_iter : int, optional
+            Number of inner iterations to pass to each ``STL.fit``.
+            If None, the STL default is used at every origin.
+        outer_iter : int, optional
+            Number of outer iterations to pass to each ``STL.fit``.
+            If None, the STL default is used at every origin.
+        fit_kwargs : dict, optional
+            Keyword arguments passed to the underlying model's ``fit``
+            method at every origin. If None, no keyword arguments are
+            passed.
+        forecast_kwargs : dict, optional
+            Keyword arguments passed to the fitted model's ``forecast``
+            method at every origin. If None, no keyword arguments are
+            passed.
+
+        Returns
+        -------
+        STLForecastBacktestResults
+            Results containing one row per origin and forecast step,
+            the actual and forecast values, and step-wise MAE and RMSE.
+
+        Raises
+        ------
+        ValueError
+            If an integer argument is outside its valid range, if
+            ``partial`` is not "drop" or "keep", if the training window
+            is longer than the initial sample, or if not a single
+            origin with a usable validation interval exists.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import pandas as pd
+        >>> from statsmodels.tsa.api import STLForecast
+        >>> from statsmodels.tsa.ar_model import AutoReg
+        >>> rs = np.random.default_rng(0)
+        >>> index = pd.date_range("2000-01-01", periods=96, freq="MS")
+        >>> y = pd.Series(np.sin(np.arange(96) * 2 * np.pi / 12)
+        ...               + rs.standard_normal(96), index=index)
+        >>> stlf = STLForecast(y, AutoReg, model_kwargs={"lags": 2}, period=12)
+        >>> bt = stlf.backtest(steps=6, initial=60, step=6, gap=1)
+        >>> bt.rmse
+        step
+        1    ...
+        2    ...
+        3    ...
+        4    ...
+        5    ...
+        6    ...
+        Name: RMSE, dtype: float64
+        """
+        if not isinstance(steps, (int, np.integer)) or isinstance(steps, bool):
+            raise ValueError("steps must be a positive integer.")
+        steps = int(steps)
+        if steps < 1:
+            raise ValueError("steps must be a positive integer.")
+        if not isinstance(step, (int, np.integer)) or isinstance(step, bool):
+            raise ValueError("step must be a positive integer.")
+        step = int(step)
+        if step < 1:
+            raise ValueError("step must be a positive integer.")
+        if not isinstance(gap, (int, np.integer)) or isinstance(gap, bool):
+            raise ValueError("gap must be a non-negative integer.")
+        gap = int(gap)
+        if gap < 0:
+            raise ValueError("gap must be a non-negative integer.")
+        if partial not in ("drop", "keep"):
+            raise ValueError('partial must be either "drop" or "keep".')
+        if window is not None:
+            if not isinstance(window, (int, np.integer)) or isinstance(
+                window, bool
+            ):
+                raise ValueError("window must be a positive integer or None.")
+            window = int(window)
+            if window < 1:
+                raise ValueError("window must be a positive integer or None.")
+
+        endog = self._endog
+        values = np.asarray(endog)
+        nobs = values.shape[0]
+        index = _get_endog_index(endog, nobs)
+        if isinstance(initial, (int, np.integer)) and not isinstance(
+            initial, bool
+        ):
+            initial = int(initial)
+            if initial < 1:
+                raise ValueError("initial must be a positive integer.")
+        else:
+            loc, _, _ = get_index_loc(initial, index)
+            initial = loc + 1
+        if window is not None and window > initial:
+            raise ValueError(
+                "window must not be larger than the initial training length."
+            )
+
+        # Positions immediately after the last training observation.
+        origin_ends = list(range(initial, nobs - gap - steps + 1, step))
+        next_end = initial + len(origin_ends) * step
+        if partial == "keep" and next_end + gap < nobs:
+            origin_ends.append(next_end)
+        if not origin_ends:
+            what = "complete" if partial == "drop" else "usable"
+            raise ValueError(
+                f"The series is too short for a {what} validation interval "
+                "given the initial length, gap and steps values."
+            )
+
+        fit_kwargs = {} if fit_kwargs is None else fit_kwargs
+        forecast_kwargs = {} if forecast_kwargs is None else forecast_kwargs
+        blocks = []
+        for train_end in origin_ends:
+            train_start = 0 if window is None else train_end - window
+            train = endog[train_start:train_end]
+            stl = STL(train, **self._stl_kwargs)
+            stl_fit = stl.fit(inner_iter=inner_iter, outer_iter=outer_iter)
+            model_endog = stl_fit.trend + stl_fit.resid
+            mod = self._model(model_endog, **self._model_kwargs)
+            mod_res = mod.fit(**fit_kwargs)
+            point = np.asarray(
+                mod_res.forecast(steps=gap + steps, **forecast_kwargs)
+            )
+            if point.shape[0] != gap + steps:
+                raise ValueError(
+                    "The model's forecast method did not return the "
+                    f"requested {gap + steps} forecasts."
+                )
+            period = stl.period
+            train_len = train_end - train_start
+            cycle = np.asarray(stl_fit.seasonal)[train_len - period :]
+            point = point + _seasonal_forecast(cycle, gap + steps)
+
+            available = min(steps, nobs - train_end - gap)
+            target_loc = np.arange(
+                train_end + gap, train_end + gap + available
+            )
+            block = pd.DataFrame(
+                {
+                    "step": np.arange(1, available + 1, dtype=np.int64),
+                    "actual": values[target_loc],
+                    "forecast": point[gap : gap + available],
+                },
+                index=pd.MultiIndex.from_arrays(
+                    [
+                        np.full(available, index[train_end - 1]),
+                        index[target_loc],
+                    ],
+                    names=["origin", "target"],
+                ),
+            )
+            blocks.append(block)
+        frame = pd.concat(blocks)
+        return STLForecastBacktestResults(frame, steps=steps, gap=gap)
+
+
+class STLForecastBacktestResults:
+    """
+    Results of a rolling-origin backtest of an ``STLForecast``
+
+    Parameters
+    ----------
+    frame : DataFrame
+        Long-format data frame with a MultiIndex named "origin" and
+        "target", containing the label of the last training observation
+        and the label of the validated observation. The columns are
+        "step" (1-based forecast horizon within the validation
+        interval), "actual" and "forecast".
+    steps : int
+        The requested forecast horizon.
+    gap : int
+        The number of observations skipped between the training sample
+        and the validation interval.
+
+    Notes
+    -----
+    Accuracy metrics are computed from the "actual" and "forecast"
+    columns of :attr:`frame`. When a partial final window was kept,
+    horizons without any validated observation report ``NaN``.
+    """
+
+    def __init__(self, frame: pd.DataFrame, steps: int, gap: int) -> None:
+        self._frame = frame
+        self._steps = steps
+        self._gap = gap
+
+    @property
+    def frame(self) -> pd.DataFrame:
+        """The actual and forecast values for every origin and step."""
+        return self._frame
+
+    @property
+    def steps(self) -> int:
+        """The requested forecast horizon."""
+        return self._steps
+
+    @property
+    def gap(self) -> int:
+        """The gap between the training sample and the validation interval."""
+        return self._gap
+
+    @property
+    def origins(self) -> pd.Index:
+        """The label of the last training observation at every origin."""
+        return self._frame.index.get_level_values("origin").unique()
+
+    def _errors(self) -> pd.Series:
+        return self._frame["actual"] - self._frame["forecast"]
+
+    @property
+    def mae(self) -> pd.Series:
+        """Mean absolute error grouped by forecast step."""
+        errors = self._errors()
+        mae = errors.abs().groupby(self._frame["step"]).mean()
+        mae = mae.reindex(np.arange(1, self._steps + 1))
+        mae.name = "MAE"
+        return mae
+
+    @property
+    def rmse(self) -> pd.Series:
+        """Root mean squared error grouped by forecast step."""
+        errors = self._errors()
+        rmse = np.sqrt(errors.pow(2).groupby(self._frame["step"]).mean())
+        rmse = rmse.reindex(np.arange(1, self._steps + 1))
+        rmse.name = "RMSE"
+        return rmse
+
+    def summary(self) -> Summary:
+        """
+        Step-wise backtest accuracy
+
+        Returns
+        -------
+        Summary
+            A table with the number of origins and the MAE and RMSE at
+            every forecast step, followed by a row pooling all steps.
+        """
+
+        def fmt(value: float) -> str:
+            return "" if np.isnan(value) else f"{value:8.6f}"
+
+        mae = self.mae
+        rmse = self.rmse
+        counts = self._frame.groupby("step").size()
+        counts = counts.reindex(np.arange(1, self._steps + 1)).fillna(0)
+        data = []
+        for horizon in range(1, self._steps + 1):
+            data.append(
+                [
+                    str(horizon),
+                    f"{int(counts.loc[horizon]):d}",
+                    fmt(mae.loc[horizon]),
+                    fmt(rmse.loc[horizon]),
+                ]
+            )
+        errors = self._errors()
+        data.append(
+            [
+                "All",
+                f"{errors.shape[0]:d}",
+                fmt(errors.abs().mean()),
+                fmt(np.sqrt(errors.pow(2).mean())),
+            ]
+        )
+        table = SimpleTable(
+            data,
+            headers=("Step", "Origins", "MAE", "RMSE"),
+            title="STL Forecast Rolling-Origin Backtest",
+        )
+        summary = Summary()
+        summary.tables.append(table)
+        return summary
+
 
 class STLForecastResults:
     """
@@ -248,15 +597,7 @@ class STLForecastResults:
         self._model_result = model_result
         self._endog = np.asarray(endog)
         self._nobs = self._endog.shape[0]
-        self._index = getattr(endog, "index", pd.RangeIndex(self._nobs))
-        if not (
-            isinstance(self._index, (pd.DatetimeIndex, pd.PeriodIndex))
-            or is_int_index(self._index)
-        ):
-            try:
-                self._index = pd.to_datetime(self._index)
-            except ValueError:
-                self._index = pd.RangeIndex(self._nobs)
+        self._index = _get_endog_index(endog, self._nobs)
 
     @property
     def period(self) -> int:
@@ -431,9 +772,7 @@ class STLForecastResults:
         period = self.period
         seasonal = np.asarray(self._result.seasonal)
         offset = self._nobs if offset is None else offset
-        seasonal = seasonal[offset - period : offset]
-        seasonal = np.tile(seasonal, steps // period + ((steps % period) != 0))
-        seasonal = seasonal[:steps]
+        seasonal = _seasonal_forecast(seasonal[offset - period : offset], steps)
         if index is not None:
             seasonal = pd.Series(seasonal, index=index)
         return seasonal

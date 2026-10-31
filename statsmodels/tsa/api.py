@@ -20,6 +20,7 @@ __all__ = [
     "MarkovAutoregression",
     "MarkovRegression",
     "STLForecast",
+    "STLForecastBacktestResults",
     "SimpleExpSmoothing",
     "UnobservedComponents",
     "acf",
@@ -81,7 +82,7 @@ from .base import datetools
 from .exponential_smoothing.ets import ETSModel
 from .filters import api as filters, bk_filter, cf_filter, hp_filter
 from .filters.hamilton_filter import hamilton_filter
-from .forecasting.stl import STLForecast
+from .forecasting.stl import STLForecast, STLForecastBacktestResults
 from .holtwinters import ExponentialSmoothing, Holt, SimpleExpSmoothing
 from .innovations import api as innovations
 from .regime_switching.markov_autoregression import MarkovAutoregression

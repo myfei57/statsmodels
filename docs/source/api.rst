@@ -216,6 +216,7 @@ Forecasting
 .. autosummary::
 
    ~statsmodels.tsa.forecasting.stl.STLForecast
+   ~statsmodels.tsa.forecasting.stl.STLForecastBacktestResults
    ~statsmodels.tsa.forecasting.theta.ThetaModel
 
 Time-Series Tools

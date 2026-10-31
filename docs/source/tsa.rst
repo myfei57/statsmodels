@@ -510,6 +510,7 @@ a random-walk model.
 
    STLForecast
    STLForecastResults
+   STLForecastBacktestResults
 
 See the notebook `Seasonal Decomposition
 <examples/notebooks/generated/stl_decomposition.ipynb>`_ for an overview.
