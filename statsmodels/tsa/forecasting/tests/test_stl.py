@@ -205,3 +205,258 @@ def test_no_var_pred(sunspots, not_implemented, close_figures):
     with pytest.warns(UserWarning, match="The variance of"):
         pred = stl_res.get_prediction()
     assert np.all(np.isnan(pred.var_pred_mean))
+
+
+HORIZON = 13
+
+
+@pytest.fixture(scope="module")
+def ets_result(data):
+    stlf = STLForecast(data, ETSModel, model_kwargs={})
+    return stlf.fit(fit_kwargs={"disp": False})
+
+
+def test_forecast_seasonal_scenario(data, ets_result):
+    horizon = HORIZON
+    default = ets_result.forecast(horizon)
+    tiled = np.asarray(ets_result._seasonal_forecast(horizon, None))
+    rng = np.random.default_rng(1234)
+    values = rng.normal(scale=2.0, size=horizon)
+    expected = np.asarray(default) - tiled + values
+
+    # Array and other array_like inputs are aligned positionally
+    assert_allclose(ets_result.forecast(horizon, seasonal_scenario=values), expected)
+    assert_allclose(
+        ets_result.forecast(horizon, seasonal_scenario=list(values)), expected
+    )
+
+    # Pandas input aligns with the out-of-sample forecast index
+    scenario = pd.Series(values, index=default.index)
+    aligned = ets_result.forecast(horizon, seasonal_scenario=scenario)
+    assert isinstance(aligned, pd.Series)
+    assert_allclose(aligned, expected)
+    assert aligned.index.equals(default.index)
+
+    # Values follow their labels even if the order is reversed
+    assert_allclose(
+        ets_result.forecast(horizon, seasonal_scenario=scenario.iloc[::-1]),
+        expected,
+    )
+
+    # A zero scenario leaves the deseasonalized model forecast
+    assert_allclose(
+        ets_result.forecast(horizon, seasonal_scenario=np.zeros(horizon)),
+        ets_result.model_result.forecast(horizon),
+        rtol=1e-10,
+    )
+
+
+def test_scenario_matching_default_tiling(ets_result):
+    horizon = 25
+    tiled = np.asarray(ets_result._seasonal_forecast(horizon, None))
+    assert_allclose(
+        ets_result.forecast(horizon, seasonal_scenario=tiled),
+        ets_result.forecast(horizon),
+    )
+
+
+def test_get_prediction_seasonal_scenario(data, ets_result):
+    nobs = data.shape[0]
+    horizon = HORIZON
+    start, end = nobs - 7, nobs + horizon - 1
+    default = ets_result.get_prediction(start, end)
+    rng = np.random.default_rng(4321)
+    values = rng.normal(scale=2.0, size=horizon)
+    scenario = pd.Series(values, index=default.row_labels[-horizon:])
+    result = ets_result.get_prediction(start, end, seasonal_scenario=scenario)
+
+    tiled = np.asarray(ets_result._seasonal_forecast(horizon, None))
+    shift = values - tiled
+
+    # Only the out-of-sample mean changes, and only by the seasonal delta
+    assert_allclose(
+        np.asarray(result.predicted_mean)[-horizon:]
+        - np.asarray(default.predicted_mean)[-horizon:],
+        shift,
+    )
+    assert_allclose(
+        np.asarray(result.predicted_mean)[:-horizon],
+        np.asarray(default.predicted_mean)[:-horizon],
+    )
+    # The variance is taken from the deseasonalized model unchanged
+    assert_allclose(result.var_pred_mean, default.var_pred_mean)
+
+    default_ci = default.conf_int()
+    result_ci = result.conf_int()
+
+    def width(ci):
+        return np.asarray(ci["upper"] - ci["lower"])
+
+    assert_allclose(width(result_ci), width(default_ci))
+    upper_shift = np.asarray(result_ci["upper"] - default_ci["upper"])
+    assert_allclose(upper_shift[:-horizon], 0.0)
+    assert_allclose(upper_shift[-horizon:], shift)
+
+    # The accepted scenario is stored and labelled
+    assert isinstance(result.seasonal_scenario, pd.Series)
+    assert result.seasonal_scenario.index.equals(default.row_labels[-horizon:])
+    assert_allclose(result.seasonal_scenario, values)
+    assert not hasattr(default, "seasonal_scenario")
+
+
+def test_seasonal_scenario_dynamic(data, ets_result):
+    nobs = data.shape[0]
+    horizon = HORIZON
+    start = nobs - 20
+    end = nobs + horizon - 1
+    default = ets_result.get_prediction(start, end, dynamic=True)
+    values = np.linspace(-1.0, 1.0, horizon)
+    result = ets_result.get_prediction(
+        start, end, dynamic=True, seasonal_scenario=values
+    )
+
+    # In-sample dynamic predictions keep their tiled seasonal values
+    assert_allclose(
+        np.asarray(result.predicted_mean)[:-horizon],
+        np.asarray(default.predicted_mean)[:-horizon],
+    )
+    assert not np.allclose(
+        np.asarray(result.predicted_mean)[-horizon:],
+        np.asarray(default.predicted_mean)[-horizon:],
+    )
+    assert_allclose(result.var_pred_mean, default.var_pred_mean)
+    assert len(result.seasonal_scenario) == horizon
+
+
+def test_seasonal_scenario_validation(data, ets_result):
+    nobs = data.shape[0]
+    horizon = HORIZON
+    oos_index = ets_result.forecast(horizon).index
+    rng = np.random.default_rng(7)
+    values = rng.standard_normal(horizon)
+
+    with pytest.raises(ValueError, match="exactly"):
+        ets_result.forecast(horizon, seasonal_scenario=values[:-1])
+    missing = values.copy()
+    missing[3] = np.nan
+    with pytest.raises(ValueError, match="missing values"):
+        ets_result.forecast(horizon, seasonal_scenario=missing)
+    with pytest.raises(ValueError, match="one-dimensional"):
+        ets_result.forecast(horizon, seasonal_scenario=np.zeros((horizon, 2)))
+    with pytest.raises(TypeError, match="numeric"):
+        ets_result.forecast(horizon, seasonal_scenario=["x"] * horizon)
+    with pytest.raises(ValueError, match="in-sample"):
+        ets_result.forecast(
+            horizon,
+            seasonal_scenario=pd.Series(values, index=data.index[-horizon:]),
+        )
+    wrong_labels = pd.DatetimeIndex(
+        list(oos_index[1:]) + [oos_index[-1] + pd.offsets.MonthEnd(1)]
+    )
+    with pytest.raises(ValueError, match="exactly match"):
+        ets_result.forecast(
+            horizon, seasonal_scenario=pd.Series(values, index=wrong_labels)
+        )
+    duplicate_labels = pd.DatetimeIndex(list(oos_index[:-1]) + [oos_index[0]])
+    with pytest.raises(ValueError, match="unique"):
+        ets_result.forecast(
+            horizon,
+            seasonal_scenario=pd.Series(values, index=duplicate_labels),
+        )
+
+    start, end = nobs - 5, nobs + horizon - 1
+    with pytest.raises(ValueError, match="exactly"):
+        ets_result.get_prediction(start, end, seasonal_scenario=values[:-1])
+    with pytest.raises(ValueError, match="in-sample"):
+        ets_result.get_prediction(
+            start,
+            end,
+            seasonal_scenario=pd.Series(values, index=data.index[-horizon:]),
+        )
+    # A scenario for an in-sample-only prediction must have zero length
+    with pytest.raises(ValueError, match="exactly 0"):
+        ets_result.get_prediction(0, nobs - 1, seasonal_scenario=values)
+
+
+def test_seasonal_scenario_not_passed_to_model(data):
+    received = {}
+
+    class RecordingResults:
+        def __init__(self, results):
+            self._results = results
+
+        def forecast(self, steps=1, **kwargs):
+            received["forecast"] = kwargs
+            return self._results.forecast(steps=steps, **kwargs)
+
+        def get_prediction(self, *args, **kwargs):
+            received["get_prediction"] = kwargs
+            return self._results.get_prediction(*args, **kwargs)
+
+        def __getattr__(self, item):
+            return getattr(self._results, item)
+
+    class RecordingModel:
+        def __init__(self, endog):
+            self._model = ETSModel(endog)
+
+        def fit(self, *args, **kwargs):
+            return RecordingResults(self._model.fit(*args, **kwargs))
+
+    res = STLForecast(data, RecordingModel, period=12).fit(fit_kwargs={"disp": False})
+    horizon = 5
+    values = np.zeros(horizon)
+    res.forecast(horizon, seasonal_scenario=values)
+    assert "seasonal_scenario" not in received["forecast"]
+    nobs = data.shape[0]
+    res.get_prediction(nobs, nobs + horizon - 1, seasonal_scenario=values)
+    assert "seasonal_scenario" not in received["get_prediction"]
+
+
+def test_seasonal_scenario_ndarray_endog(data):
+    endog = np.asarray(data)
+    nobs = endog.shape[0]
+    res = STLForecast(endog, ETSModel, model_kwargs={}, period=12).fit(
+        fit_kwargs={"disp": False}
+    )
+    horizon = 7
+    values = np.linspace(0.5, 1.5, horizon)
+    got = res.forecast(horizon, seasonal_scenario=values)
+    assert isinstance(got, np.ndarray)
+    assert_allclose(got, np.asarray(res.model_result.forecast(horizon)) + values)
+
+    # A Series aligned to the integer labels of the out-of-sample steps
+    labelled = pd.Series(values, index=pd.RangeIndex(nobs, nobs + horizon))
+    assert_allclose(res.forecast(horizon, seasonal_scenario=labelled), got)
+
+    # A default RangeIndex starts at zero and therefore covers in-sample
+    with pytest.raises(ValueError, match="in-sample"):
+        res.forecast(horizon, seasonal_scenario=pd.Series(values))
+
+
+def test_seasonal_scenario_period_index(data):
+    period_data = data.to_period(freq="M")
+    res = STLForecast(period_data, ETSModel, model_kwargs={}, period=12).fit(
+        fit_kwargs={"disp": False}
+    )
+    horizon = 6
+    default = res.forecast(horizon)
+    values = np.linspace(-2.0, 2.0, horizon)
+    got = res.forecast(
+        horizon, seasonal_scenario=pd.Series(values, index=default.index)
+    )
+    assert isinstance(got.index, pd.PeriodIndex)
+    expected = np.asarray(res.model_result.forecast(horizon)) + values
+    assert_allclose(np.asarray(got), expected)
+    with pytest.raises(ValueError, match="in-sample"):
+        res.forecast(
+            horizon,
+            seasonal_scenario=pd.Series(values, index=period_data.index[-horizon:]),
+        )
+
+
+def test_seasonal_scenario_leaves_fitted_component(ets_result):
+    before = np.asarray(ets_result.result.seasonal).copy()
+    ets_result.forecast(HORIZON, seasonal_scenario=np.ones(HORIZON))
+    ets_result.get_prediction(490, 499 + HORIZON, seasonal_scenario=np.ones(HORIZON))
+    assert_allclose(np.asarray(ets_result.result.seasonal), before)

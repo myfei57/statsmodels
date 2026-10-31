@@ -112,6 +112,10 @@ class STLForecast:
     where :math:`k = m - h + m \lfloor (h-1)/m \rfloor` tracks the period
     offset in the full cycle of 1, 2, ..., m where m is the period length.
 
+    Alternatively, ``forecast`` and ``get_prediction`` accept a deterministic
+    ``seasonal_scenario`` that replaces these extrapolated seasonal values for
+    the out-of-sample steps.
+
     This class is mostly a convenience wrapper around ``STL`` and a
     user-specified model. The model is assumed to follow the standard
     statsmodels pattern:
@@ -343,7 +347,8 @@ class STLForecastResults:
         start: DateLike | None,
         end: DateLike | None,
         dynamic: bool | DateLike,
-    ) -> np.ndarray:
+        seasonal_scenario: Any = None,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
         """
         Get STL's seasonal in- and out-of-sample predictions
 
@@ -369,11 +374,19 @@ class STLForecastResults:
             prediction; starting with this observation and continuing through
             the end of prediction, forecasted endogenous values will be used
             instead.
+        seasonal_scenario : array_like, pandas.Series, or None
+            Deterministic seasonal values that replace the extrapolated
+            seasonal component on the out-of-sample steps. If None, the
+            seasonal component is extrapolated by repeating the final
+            seasonal cycle.
 
         Returns
         -------
-        ndarray
+        predictions : ndarray
             Array containing the seasonal predictions.
+        scenario : ndarray or None
+            The validated out-of-sample seasonal scenario values, or None
+            if no scenario was provided.
         """
         data = PandasData(pd.Series(self._endog), index=self._index)
         if start is None:
@@ -404,7 +417,129 @@ class STLForecastResults:
             oos_start = max(start - nobs, 0)
             oos = oos[oos_start:]
         predictions = np.r_[predictions, oos]
-        return predictions
+        scenario_values = None
+        if seasonal_scenario is not None:
+            # The scenario only replaces the true out-of-sample tail. The
+            # leading entries are in-sample dates, including dates whose
+            # seasonal values are produced by dynamic prediction.
+            n_in_sample = max(nobs - start, 0)
+            oos_index = (
+                prediction_index[n_in_sample:] if prediction_index is not None else None
+            )
+            scenario_values = self._validate_seasonal_scenario(
+                seasonal_scenario,
+                oos_index,
+                predictions.shape[0] - n_in_sample,
+            )
+            predictions[n_in_sample:] = scenario_values
+        return predictions, scenario_values
+
+    def _out_of_sample_index(self, steps: DateLike) -> pd.Index | None:
+        """
+        Get the index labels of the out-of-sample forecast steps
+
+        Parameters
+        ----------
+        steps : int, str, or datetime
+            The number of steps to forecast, or the label of the final
+            out-of-sample observation.
+
+        Returns
+        -------
+        pd.Index or None
+            The index covering the out-of-sample forecast steps.
+        """
+        data = PandasData(pd.Series(self._endog), index=self._index)
+        if isinstance(steps, (int, np.integer)) and not isinstance(steps, bool):
+            end = self._nobs + int(steps) - 1
+        else:
+            end = steps
+        _, _, _, prediction_index = get_prediction_index(
+            self._nobs, end, self._nobs, self._index, data=data
+        )
+        return prediction_index
+
+    def _validate_seasonal_scenario(
+        self,
+        seasonal_scenario: Any,
+        forecast_index: pd.Index | None,
+        steps: int,
+    ) -> np.ndarray:
+        """
+        Validate a deterministic seasonal scenario
+
+        Parameters
+        ----------
+        seasonal_scenario : array_like or pandas.Series
+            Seasonal values for the out-of-sample forecast steps. A
+            pandas Series is aligned using its index. Other array-like
+            inputs are aligned positionally.
+        forecast_index : pd.Index or None
+            The labels of the out-of-sample forecast steps. Used to align
+            pandas inputs. If None, pandas inputs cannot be label-aligned.
+        steps : int
+            The number of out-of-sample forecast steps.
+
+        Returns
+        -------
+        ndarray
+            The scenario values in the order of the forecast steps.
+
+        Raises
+        ------
+        TypeError
+            If the scenario does not contain numeric values.
+        ValueError
+            If the scenario is not one-dimensional, has missing values,
+            has the wrong length, has a non-unique index, contains
+            in-sample labels, or its index does not match the
+            out-of-sample forecast index.
+        """
+        is_pandas = isinstance(seasonal_scenario, pd.Series)
+        scenario_index = seasonal_scenario.index if is_pandas else None
+        if is_pandas and not scenario_index.is_unique:
+            raise ValueError(
+                "The index of seasonal_scenario must contain unique labels."
+            )
+        try:
+            values = np.asarray(seasonal_scenario, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("seasonal_scenario must contain numeric values.") from exc
+        if values.ndim != 1:
+            raise ValueError("seasonal_scenario must be one-dimensional.")
+        if values.shape[0] != steps:
+            raise ValueError(
+                f"seasonal_scenario must contain exactly {steps} value(s), "
+                f"one for each out-of-sample forecast step, but got "
+                f"{values.shape[0]}."
+            )
+        if np.isnan(values).any():
+            raise ValueError("seasonal_scenario must not contain missing values (NaN).")
+        if is_pandas and forecast_index is not None:
+            in_sample = scenario_index.isin(self._index)
+            if in_sample.any():
+                overlap = scenario_index[in_sample].tolist()
+                raise ValueError(
+                    "seasonal_scenario must only cover out-of-sample "
+                    "observations, but its index contains in-sample "
+                    f"labels: {overlap}."
+                )
+            missing = forecast_index.difference(scenario_index)
+            unexpected = scenario_index.difference(forecast_index)
+            if len(missing) or len(unexpected):
+                raise ValueError(
+                    "The index of seasonal_scenario must exactly match the "
+                    "out-of-sample forecast index. Missing labels: "
+                    f"{missing.tolist()}; unexpected labels: "
+                    f"{unexpected.tolist()}."
+                )
+            # Reorder (or cast) to the forecast index while keeping the
+            # values attached to their labels. The label sets match, so no
+            # missing values can be introduced here.
+            values = np.asarray(
+                seasonal_scenario.reindex(forecast_index), dtype=np.float64
+            )
+        return values
 
     def _seasonal_forecast(
         self, steps: int, index: pd.Index | None, offset=None
@@ -439,7 +574,10 @@ class STLForecastResults:
         return seasonal
 
     def forecast(
-        self, steps: int = 1, **kwargs: dict[str, Any]
+        self,
+        steps: int = 1,
+        seasonal_scenario: Any = None,
+        **kwargs: dict[str, Any],
     ) -> np.ndarray | pd.Series:
         """
         Out-of-sample forecasts
@@ -451,6 +589,15 @@ class STLForecastResults:
             sample. Can also be a date string to parse or a datetime type.
             However, if the dates index does not have a fixed frequency, steps
             must be an integer. Default is 1.
+        seasonal_scenario : array_like or pandas.Series, optional
+            Deterministic values of the seasonal component for the
+            out-of-sample forecast steps. Must contain exactly one value
+            per forecast step, and missing values are not allowed. If a
+            pandas Series, its index must exactly match the index of the
+            out-of-sample forecasts and must not contain in-sample
+            labels. If None, the seasonal component is extrapolated by
+            repeating the last seasonal cycle. The scenario is not passed
+            to the underlying model fitted on the deseasonalized data.
         **kwargs
             Additional arguments may be required for forecasting beyond the
             end of the sample. These arguments are passed into the time
@@ -463,13 +610,25 @@ class STLForecastResults:
         """
         forecast = self._model_result.forecast(steps=steps, **kwargs)
         index = forecast.index if isinstance(forecast, pd.Series) else None
-        return forecast + self._seasonal_forecast(steps, index)
+        seasonal = self._seasonal_forecast(steps, index)
+        if seasonal_scenario is not None:
+            if index is None:
+                index = self._out_of_sample_index(steps)
+            scenario = self._validate_seasonal_scenario(
+                seasonal_scenario, index, np.asarray(forecast).shape[0]
+            )
+            if isinstance(seasonal, pd.Series):
+                seasonal = pd.Series(scenario, index=index)
+            else:
+                seasonal = scenario
+        return forecast + seasonal
 
     def get_prediction(
         self,
         start: DateLike | None = None,
         end: DateLike | None = None,
         dynamic: bool | DateLike = False,
+        seasonal_scenario: Any = None,
         **kwargs: dict[str, Any],
     ):
         """
@@ -496,6 +655,17 @@ class STLForecastResults:
             prediction; starting with this observation and continuing through
             the end of prediction, forecasted endogenous values will be used
             instead.
+        seasonal_scenario : array_like or pandas.Series, optional
+            Deterministic values of the seasonal component for the
+            out-of-sample forecast steps. Must contain exactly one value
+            per out-of-sample step, and missing values are not allowed.
+            If a pandas Series, its index must exactly match the index of
+            the out-of-sample forecasts and must not contain in-sample
+            labels. The scenario only replaces the out-of-sample
+            seasonal values; in-sample predictions are unchanged. If
+            None, the seasonal component is extrapolated by repeating
+            the last seasonal cycle. The scenario is not passed to the
+            underlying model fitted on the deseasonalized data.
         **kwargs
             Additional arguments may be required for forecasting beyond the
             end of the sample. These arguments are passed into the time
@@ -505,12 +675,27 @@ class STLForecastResults:
         -------
         PredictionResults
             PredictionResults instance containing in-sample predictions,
-            out-of-sample forecasts, and prediction intervals.
+            out-of-sample forecasts, and prediction intervals. When
+            ``seasonal_scenario`` is provided, the instance additionally
+            stores the accepted scenario in its ``seasonal_scenario``
+            attribute.
+
+        Notes
+        -----
+        The values of ``seasonal_scenario`` are treated as fixed and known.
+        The underlying model is still fit and used to forecast on the
+        deseasonalized data, so its predicted mean and
+        ``var_pred_mean`` are computed without any contribution from
+        seasonal uncertainty. The scenario only shifts the predicted mean
+        and the prediction intervals: their width is unchanged, and the
+        intervals are conditional on the given seasonal scenario.
         """
         pred = self._model_result.get_prediction(
             start=start, end=end, dynamic=dynamic, **kwargs
         )
-        seasonal_prediction = self._get_seasonal_prediction(start, end, dynamic)
+        seasonal_prediction, scenario = self._get_seasonal_prediction(
+            start, end, dynamic, seasonal_scenario
+        )
         mean = pred.predicted_mean + seasonal_prediction
         try:
             var_pred_mean = pred.var_pred_mean
@@ -525,6 +710,16 @@ class STLForecastResults:
                 stacklevel=2,
             )
             var_pred_mean = np.nan + mean.copy()
-        return PredictionResults(
+        results = PredictionResults(
             mean, var_pred_mean, dist="norm", row_labels=pred.row_labels
         )
+        if scenario is not None:
+            labels = results.row_labels
+            if labels is not None:
+                scenario_index = labels[len(labels) - scenario.shape[0] :]
+                results.seasonal_scenario = pd.Series(
+                    scenario, index=scenario_index, name="seasonal_scenario"
+                )
+            else:
+                results.seasonal_scenario = scenario
+        return results

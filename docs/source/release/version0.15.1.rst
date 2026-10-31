@@ -201,6 +201,16 @@ New functions and methods
   ``one_sided=True``, the trend at time t only depends on the observations up
   to and including t. It is computed with the Kalman filter of the state space
   form of the HP filter. :issue:`6947`, :pr:`10588`
+- ``forecast`` and ``get_prediction`` of
+  :class:`~statsmodels.tsa.forecasting.stl.STLForecastResults` accept a
+  ``seasonal_scenario`` with deterministic seasonal values for the
+  out-of-sample steps, which replaces the default extrapolation that repeats
+  the last seasonal cycle. Pandas input must be aligned with the
+  out-of-sample forecast index, and missing values, wrong lengths and
+  in-sample labels are rejected. The scenario shifts only the predicted mean
+  and prediction intervals, whose width is unchanged; the intervals are
+  conditional on the scenario and the variance from the deseasonalized model
+  is not modified.
 - Add :func:`~statsmodels.stats.multicollinearity.vif`,
   :func:`~statsmodels.stats.multicollinearity.vif_ridge` and
   :func:`~statsmodels.stats.multicollinearity.collinear_index` for the
