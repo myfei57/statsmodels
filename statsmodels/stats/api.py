@@ -70,12 +70,14 @@ from .meta_analysis import (
 from .multicollinearity import collinear_index, vif, vif_ridge
 from .multicomp import tukeyhsd
 from .multitest import (
+    LeaveOneOutSensitivityResult,
     NullDistribution,
     fdrcorrection,
     fdrcorrection_twostage,
     local_fdr,
     local_fdr_correction,
     multipletests,
+    multipletests_leave_one_out,
 )
 from .multivariate import (
     confint_mvmean,
@@ -192,6 +194,7 @@ __all__ = [
     "FTestPower",
     "FactoredPSDMatrix",
     "GofChisquarePower",
+    "LeaveOneOutSensitivityResult",
     "Mediation",
     "NormalIndPower",
     "NullDistribution",
@@ -288,6 +291,7 @@ __all__ = [
     "multicomp",
     "multinomial_proportions_confint",
     "multipletests",
+    "multipletests_leave_one_out",
     "nonequivalence_poisson_2indep",
     "normal_ad",
     "omni_normtest",

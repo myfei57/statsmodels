@@ -23,12 +23,14 @@ from scipy.stats.distributions import norm
 
 from statsmodels.stats.multicomp import tukeyhsd
 from statsmodels.stats.multitest import (
+    LeaveOneOutSensitivityResult,
     NullDistribution,
     fdrcorrection,
     fdrcorrection_twostage,
     local_fdr,
     local_fdr_correction,
     multipletests,
+    multipletests_leave_one_out,
     multitest_methods_names,
 )
 
@@ -746,3 +748,242 @@ def test_local_fdr_param_validation():
     # the defaults still produce a full fdr curve
     fdr = local_fdr(zscores)
     assert fdr.shape == (200,)
+
+
+def test_leave_one_out_holm_handcalculated():
+    # Manually worked Holm example at alpha=0.05.
+    # Full family sorted: 0.01, 0.03, 0.04 with thresholds
+    # alpha/3, alpha/2, alpha -> only 0.01 is rejected; corrected p-values
+    # are 0.03, 0.06, 0.06.
+    res = multipletests_leave_one_out([0.01, 0.04, 0.03], alpha=0.05, method="holm")
+
+    assert isinstance(res, LeaveOneOutSensitivityResult)
+    assert_equal(res.reject, np.array([True, False, False]))
+    assert_allclose(res.pvals_corrected, [0.03, 0.06, 0.06])
+
+    # rows index the retained hypothesis in original order, columns index
+    # the removed hypothesis: removing 0.01 leaves no rejections; removing
+    # 0.04 or 0.03 makes the remaining two both significant
+    assert_equal(
+        res.reject_loo,
+        np.array(
+            [
+                [False, True, True],  # p = 0.01
+                [False, False, True],  # p = 0.04
+                [False, True, False],  # p = 0.03
+            ]
+        ),
+    )
+    # Holm on the reduced family [0.01, 0.03] gives corrected 0.02, 0.03
+    assert_allclose(res.pvals_corrected_loo[0, 1], 0.02)
+    assert_allclose(res.pvals_corrected_loo[2, 1], 0.03)
+    assert np.isnan(res.pvals_corrected_loo[1, 1])
+
+    assert_equal(
+        res.changed,
+        np.array(
+            [
+                [False, False, False],
+                [False, False, True],
+                [False, True, False],
+            ]
+        ),
+    )
+    assert [idx.tolist() for idx in res.changed_indices] == [[], [2], [1]]
+    assert res.alpha == 0.05
+    assert res.method == "holm"
+
+
+def test_leave_one_out_fdr_bh_handcalculated():
+    # Manually worked Benjamini-Hochberg example at alpha=0.05.
+    # BH thresholds k*0.05/4 are 0.0125, 0.025, 0.0375, 0.05, so the full
+    # family rejects only 0.01 and 0.02.
+    pvals = np.array([0.01, 0.02, 0.04, 0.10])
+    res = multipletests_leave_one_out(pvals, method="fdr_bh")
+
+    assert_equal(res.reject, np.array([True, True, False, False]))
+    assert_allclose(res.pvals_corrected, [0.04, 0.04, 0.04 * 4.0 / 3.0, 0.10])
+
+    # removing the smallest p-value shifts ranks: 0.02 fails 0.05/3 in the
+    # reduced family and loses its rejection
+    assert not res.reject_loo[1, 0]
+    # removing the largest p-value: the third BH threshold in the reduced
+    # family is 0.05, so 0.04 gains a rejection
+    assert res.reject_loo[2, 3]
+    assert [idx.tolist() for idx in res.changed_indices] == [[], [0], [3], []]
+    assert res.changed.sum() == 2
+
+
+@pytest.mark.parametrize("method", sorted(multitest_methods_names))
+def test_leave_one_out_matches_sequential_multipletests(method):
+    # The sensitivity analysis must be exactly a series of multipletests
+    # calls with one p-value deleted each time, mapped back to the original
+    # positions. Include ties and a shuffled input order so that
+    # original-order restoration is exercised. Exact boundary values 0/1
+    # are covered separately (method "lfdr" does not support exact zeros
+    # through scipy's isotonic regression).
+    rng = np.random.default_rng(987654)
+    pvals = rng.random(9)
+    pvals[1] = pvals[2] = 0.21
+    pvals = pvals[[6, 0, 8, 2, 4, 1, 7, 3, 5]]
+    alpha = 0.1
+
+    res = multipletests_leave_one_out(pvals, alpha=alpha, method=method)
+
+    reject, pvals_corrected, _, _ = multipletests(pvals, alpha=alpha, method=method)
+    assert_equal(res.reject, reject)
+    assert_allclose(res.pvals_corrected, pvals_corrected)
+
+    ntests = pvals.shape[0]
+    assert res.reject_loo.shape == (ntests, ntests)
+    assert res.pvals_corrected_loo.shape == (ntests, ntests)
+
+    expected_reject = np.zeros((ntests, ntests), dtype=bool)
+    expected_corrected = np.full((ntests, ntests), np.nan)
+    expected_changed = np.zeros((ntests, ntests), dtype=bool)
+    all_index = np.arange(ntests)
+    for removed in range(ntests):
+        keep = np.delete(all_index, removed)
+        rej_keep, corr_keep, _, _ = multipletests(
+            pvals[keep], alpha=alpha, method=method
+        )
+        expected_reject[keep, removed] = rej_keep
+        expected_corrected[keep, removed] = corr_keep
+        expected_changed[keep, removed] = rej_keep != reject[keep]
+
+    assert_equal(res.reject_loo, expected_reject)
+    assert_allclose(res.pvals_corrected_loo, expected_corrected, equal_nan=True)
+    assert_equal(res.changed, expected_changed)
+
+    # the diagonal is the excluded "self-removal" entry in every matrix
+    assert not res.reject_loo.diagonal().any()
+    assert not res.changed.diagonal().any()
+    assert np.all(np.isnan(res.pvals_corrected_loo.diagonal()))
+
+    # changed_indices reports the flipped removals at original positions
+    assert len(res.changed_indices) == ntests
+    for i in range(ntests):
+        assert_equal(res.changed_indices[i], np.flatnonzero(expected_changed[i]))
+    assert res.alpha == alpha
+    assert res.method == method
+
+
+def test_leave_one_out_ties_keep_original_positions():
+    # Equal p-values must remain distinct hypotheses; deleting position 0,
+    # 1, or 2 yields the same numerical family but fills a different column.
+    pvals = np.array([0.2, 0.2, 0.2, 0.01])
+    res = multipletests_leave_one_out(pvals, alpha=0.05, method="holm")
+    assert_equal(res.reject, np.array([False, False, False, True]))
+
+    # removing any one of the tied 0.2 values: Holm on [0.2, 0.2, 0.01]
+    # still rejects only 0.01, which must remain on row 3
+    for removed in (0, 1, 2):
+        assert_equal(
+            np.delete(res.reject_loo[:, removed], removed),
+            np.array([False, False, True]),
+        )
+        assert res.reject_loo[3, removed]
+    # removing 0.01 leaves the three 0.2 hypotheses all non-rejected
+    assert not res.reject_loo[:3, 3].any()
+    assert not res.changed.any()
+
+    # BH ties: both 0.0125 hypotheses are rejected in the full family and
+    # each survives removal of the other (they occupy different rows).
+    pvals = np.array([0.0125, 0.0125, 0.9])
+    res = multipletests_leave_one_out(pvals, method="fdr_bh")
+    assert_equal(res.reject, np.array([True, True, False]))
+    assert res.reject_loo[0, 1]
+    assert res.reject_loo[1, 0]
+    assert not res.reject_loo[2, 0]
+    assert not res.reject_loo[2, 1]
+    assert not res.changed.any()
+
+
+@pytest.mark.parametrize("empty", [[], np.array([])])
+@pytest.mark.parametrize("method", ["holm", "fdr_bh"])
+def test_leave_one_out_empty(empty, method):
+    res = multipletests_leave_one_out(empty, method=method)
+    assert res.reject.shape == (0,)
+    assert res.pvals_corrected.shape == (0,)
+    assert res.reject_loo.shape == (0, 0)
+    assert res.pvals_corrected_loo.shape == (0, 0)
+    assert res.changed.shape == (0, 0)
+    assert res.changed_indices == []
+
+
+def test_leave_one_out_single_hypothesis():
+    res = multipletests_leave_one_out([0.01], alpha=0.05, method="holm")
+    assert_equal(res.reject, np.array([True]))
+    assert_allclose(res.pvals_corrected, [0.01])
+    # the only scenario removes the sole hypothesis, so it is empty
+    assert res.reject_loo.shape == (1, 1)
+    assert not res.reject_loo[0, 0]
+    assert np.isnan(res.pvals_corrected_loo[0, 0])
+    assert not res.changed.any()
+    assert len(res.changed_indices) == 1
+    assert res.changed_indices[0].size == 0
+
+    res = multipletests_leave_one_out([0.5], method="fdr_bh")
+    assert_equal(res.reject, np.array([False]))
+    assert res.changed_indices[0].size == 0
+
+
+@pytest.mark.parametrize("method", ["holm", "fdr_bh"])
+def test_leave_one_out_boundary_pvalues(method):
+    # p-values exactly on the [0, 1] boundaries are accepted
+    pvals = np.array([0.0, 0.5, 1.0])
+    res = multipletests_leave_one_out(pvals, alpha=0.05, method=method)
+    assert res.reject[0]
+    assert not res.reject[2]
+    for removed in range(3):
+        keep = np.delete(np.arange(3), removed)
+        reject_keep, _, _, _ = multipletests(pvals[keep], method=method)
+        assert_equal(res.reject_loo[keep, removed], reject_keep)
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_leave_one_out_rejects_nonfinite(bad):
+    with pytest.raises(ValueError, match="finite"):
+        multipletests_leave_one_out([0.1, bad, 0.5])
+
+
+@pytest.mark.parametrize("bad", [-0.01, 1.01, 2.0])
+def test_leave_one_out_rejects_out_of_range(bad):
+    with pytest.raises(ValueError, match=r"range \[0, 1\]"):
+        multipletests_leave_one_out([0.1, bad])
+
+
+def test_leave_one_out_rejects_bad_shape_alpha_method():
+    with pytest.raises(ValueError, match="ndim"):
+        multipletests_leave_one_out(np.array([[0.1, 0.2], [0.3, 0.4]]))
+    for alpha in (0, 1, -0.5, 1.5):
+        with pytest.raises(ValueError, match="alpha must be in the range"):
+            multipletests_leave_one_out([0.1, 0.2], alpha=alpha)
+    with pytest.raises(ValueError, match="method not recognized"):
+        multipletests_leave_one_out([0.1, 0.2], method="not_a_method")
+    # an unrecognized method is rejected on empty input as well
+    with pytest.raises(ValueError, match="method not recognized"):
+        multipletests_leave_one_out([], method="not_a_method")
+
+
+def test_leave_one_out_does_not_modify_input():
+    pvals = np.array([0.01, 0.04, 0.03, 0.5])
+    snapshot = pvals.copy()
+    res = multipletests_leave_one_out(pvals, method="fdr_bh")
+    assert_allclose(pvals, snapshot)
+    # a failed call must not modify the input either
+    with pytest.raises(ValueError, match="alpha must be in the range"):
+        multipletests_leave_one_out(pvals, alpha=1.5)
+    assert_allclose(pvals, snapshot)
+    # plain Python lists are accepted and results follow input positions
+    assert res.reject.tolist() == [True, False, False, False]
+
+
+def test_leave_one_out_exported_from_stats_api():
+    from statsmodels.stats.api import (
+        LeaveOneOutSensitivityResult as ApiResult,
+        multipletests_leave_one_out as api_fn,
+    )
+
+    assert api_fn is multipletests_leave_one_out
+    assert ApiResult is LeaveOneOutSensitivityResult

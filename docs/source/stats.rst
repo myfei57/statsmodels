@@ -351,6 +351,8 @@ means when the variances differ across groups.
    :toctree: generated/
 
    multipletests
+   multipletests_leave_one_out
+   LeaveOneOutSensitivityResult
    fdrcorrection
    local_fdr_correction
    LocalFDRCorrectionResult

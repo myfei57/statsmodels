@@ -15,6 +15,7 @@ import numpy as np
 from statsmodels.stats._knockoff import RegressionFDR
 
 __all__ = [
+    "LeaveOneOutSensitivityResult",
     "LocalFDRCorrectionResult",
     "NullDistribution",
     "RegressionFDR",
@@ -23,6 +24,7 @@ __all__ = [
     "local_fdr",
     "local_fdr_correction",
     "multipletests",
+    "multipletests_leave_one_out",
 ]
 
 from statsmodels.tools.validation import (
@@ -338,6 +340,213 @@ def multipletests(
         reject_ = np.empty_like(reject)
         reject_[sortind] = reject
         return reject_, pvals_corrected_, alphacSidak, alphacBonf
+
+
+class LeaveOneOutSensitivityResult(NamedTuple):
+    """
+    Result of :func:`multipletests_leave_one_out`.
+
+    Parameters
+    ----------
+    reject : ndarray of bool
+        Rejection decision of each hypothesis in the full family, in the
+        order of the p-values passed to the function.
+    pvals_corrected : ndarray of float
+        Corrected p-values of each hypothesis in the full family, in the
+        order of the p-values passed to the function.
+    reject_loo : ndarray of bool
+        Leave-one-out rejection decisions, with shape ``(ntests, ntests)``.
+        Entry ``[i, j]`` is the decision for hypothesis ``i`` after removing
+        hypothesis ``j``; rows and columns index the original input
+        positions. The diagonal entry ``[i, i]`` is a placeholder (the
+        hypothesis is not part of its own reduced family) and is always
+        ``False``; use ``changed`` or ``changed_indices``, which exclude the
+        diagonal, instead of reading it directly.
+    pvals_corrected_loo : ndarray of float
+        Corrected p-values of the reduced families, with shape
+        ``(ntests, ntests)``. Entry ``[i, j]`` is the corrected p-value of
+        hypothesis ``i`` after removing hypothesis ``j``. The diagonal is
+        filled with ``nan``.
+    changed : ndarray of bool
+        ``changed[i, j]`` is ``True`` if the decision for hypothesis ``i``
+        after removing hypothesis ``j`` differs from its decision in the
+        full family. The diagonal is always ``False``.
+    changed_indices : list of ndarray of int
+        For each hypothesis ``i``, the indices ``j`` of the hypotheses whose
+        removal flips the decision of ``i`` relative to the full family.
+        ``changed_indices[i][k]`` indexes the original input positions.
+    alpha : float
+        The family-wise error rate (or false discovery rate level) used.
+    method : str
+        The correction method used, as passed to the function.
+    """
+
+    reject: np.ndarray
+    pvals_corrected: np.ndarray
+    reject_loo: np.ndarray
+    pvals_corrected_loo: np.ndarray
+    changed: np.ndarray
+    changed_indices: list
+    alpha: float
+    method: str
+
+
+def multipletests_leave_one_out(pvals, alpha=0.05, method="holm"):
+    """
+    Leave-one-out sensitivity analysis of multiple testing decisions
+
+    Recomputes the multiple testing correction after removing each
+    hypothesis in turn, so that the dependence of the conclusions on the
+    members of the testing family can be assessed.
+
+    Parameters
+    ----------
+    pvals : array_like, 1-d
+        Uncorrected p-values. Must be one-dimensional, finite, and in the
+        range ``[0, 1]``. The input is not modified.
+    alpha : float, optional
+        Family-wise error rate or false discovery rate level, e.g., 0.1.
+        Must be in the range ``(0, 1)``.
+    method : str, optional
+        Correction method applied both to the full family and to every
+        reduced family. Any method accepted by :func:`multipletests` can be
+        used (full name or initials, see there for the full list); the
+        Holm (``"holm"``) and Benjamini-Hochberg (``"fdr_bh"``) procedures
+        are the standard choices.
+
+    Returns
+    -------
+    LeaveOneOutSensitivityResult
+        A named tuple containing the full-family results and, for every
+        hypothesis, the decisions obtained under each single removal. See
+        :class:`LeaveOneOutSensitivityResult` for the fields.
+
+    Raises
+    ------
+    ValueError
+        If the p-values are not one-dimensional, are not finite, are
+        outside ``[0, 1]``, if ``alpha`` is not in ``(0, 1)``, or if
+        ``method`` is not recognized.
+
+    See Also
+    --------
+    multipletests
+        Correction applied to the full family and to each reduced family.
+
+    Notes
+    -----
+    The full family is corrected with :func:`multipletests`. Then, for each
+    hypothesis ``j``, the p-value of ``j`` is deleted and the same
+    correction is run on the remaining ``ntests - 1`` p-values. Results are
+    mapped back to the original input positions: equal p-values remain
+    distinct hypotheses and are never conflated.
+
+    This is a *descriptive* sensitivity analysis: the testing family itself
+    changes from scenario to scenario. The error-rate guarantees of the
+    underlying procedure apply separately within each (full or reduced)
+    family. They do not imply any control of a joint error rate across the
+    collection of all removal scenarios, and decisions should not be
+    combined across scenarios as if a multiple testing correction had been
+    applied to the collection.
+
+    Removing a hypothesis can change a decision in either direction,
+    depending on the procedure: for step-down methods such as Holm a
+    retained hypothesis can only gain rejections when the family becomes
+    smaller, whereas rank-based procedures such as Benjamini-Hochberg can
+    also lose rejections because the ranks of the remaining p-values
+    change.
+
+    Examples
+    --------
+    Holm correction. The full family rejects only the hypothesis with
+    p-value 0.01. Removing the p-value 0.04 or the p-value 0.03 makes the
+    remaining borderline hypothesis significant:
+
+    >>> import numpy as np
+    >>> from statsmodels.stats.multitest import multipletests_leave_one_out
+    >>> pvals = [0.01, 0.04, 0.03]
+    >>> res = multipletests_leave_one_out(pvals, alpha=0.05, method="holm")
+    >>> res.reject.astype(int)
+    array([1, 0, 0])
+    >>> res.pvals_corrected
+    array([0.03, 0.06, 0.06])
+    >>> res.reject_loo.astype(int)
+    array([[0, 1, 1],
+           [0, 0, 1],
+           [0, 1, 0]])
+    >>> [idx.tolist() for idx in res.changed_indices]
+    [[], [2], [1]]
+
+    Benjamini-Hochberg correction. Removing the smallest p-value (index 0)
+    makes hypothesis 1 lose its rejection, while removing the largest
+    p-value (index 3) makes hypothesis 2 gain one:
+
+    >>> pvals = np.array([0.01, 0.02, 0.04, 0.10])
+    >>> res = multipletests_leave_one_out(pvals, method="fdr_bh")
+    >>> res.reject.astype(int)
+    array([1, 1, 0, 0])
+    >>> [idx.tolist() for idx in res.changed_indices]
+    [[], [0], [3], []]
+    """
+    pvals = array_like(pvals, "pvals", ndim=1, maxdim=1, dtype=float)
+
+    if pvals.size:
+        if not np.all(np.isfinite(pvals)):
+            # multipletests itself lets NaN pass through, but silently
+            # re-running a family correction around missing p-values would
+            # produce meaningless leave-one-out decisions, so reject them
+            # here together with infinities.
+            raise ValueError("p-values must be finite, got NaN or infinite p-values")
+        if pvals.min() < 0 or pvals.max() > 1:
+            raise ValueError(
+                "p-values must be in the range [0, 1]; got "
+                f"[{pvals.min()}, {pvals.max()}]"
+            )
+
+    alpha = float_like(alpha, "alpha")
+    if not 0 < alpha < 1:
+        raise ValueError(f"alpha must be in the range (0, 1), got {alpha}")
+
+    reject, pvals_corrected, _, _ = multipletests(pvals, alpha=alpha, method=method)
+
+    ntests = pvals.shape[0]
+
+    # Rows index the retained hypothesis and columns index the removed
+    # hypothesis, both in original input positions. The diagonal is the
+    # undefined "hypothesis removed from its own family" case.
+    reject_loo = np.zeros((ntests, ntests), dtype=bool)
+    pvals_corrected_loo = np.full((ntests, ntests), np.nan)
+
+    all_index = np.arange(ntests)
+    for removed in range(ntests):
+        # Advanced indexing copies, so the p-values handed to multipletests
+        # never alias the caller's array; deleting by position (not by
+        # value) keeps tied p-values distinguishable.
+        keep = np.delete(all_index, removed)
+        if keep.size == 0:
+            # Single hypothesis in the full family: removing it leaves an
+            # empty reduced family, so its removal scenario stays empty.
+            continue
+        reject_keep, pvals_corrected_keep, _, _ = multipletests(
+            pvals[keep], alpha=alpha, method=method
+        )
+        reject_loo[keep, removed] = reject_keep
+        pvals_corrected_loo[keep, removed] = pvals_corrected_keep
+
+    removed_mask = np.eye(ntests, dtype=bool)
+    changed = (reject_loo != reject[:, None]) & ~removed_mask
+    changed_indices = [np.flatnonzero(changed[i]) for i in range(ntests)]
+
+    return LeaveOneOutSensitivityResult(
+        reject=reject,
+        pvals_corrected=pvals_corrected,
+        reject_loo=reject_loo,
+        pvals_corrected_loo=pvals_corrected_loo,
+        changed=changed,
+        changed_indices=changed_indices,
+        alpha=alpha,
+        method=method,
+    )
 
 
 def fdrcorrection(pvals, alpha=0.05, method="indep", is_sorted=False):

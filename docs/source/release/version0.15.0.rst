@@ -681,6 +681,10 @@ New Features and Enhancements
   one update cycle and yields the current imputed dataset, so
   ``itertools.islice(mice_data, n)`` produces ``n`` successive imputed
   datasets. :pr:`10210`
+- Add ``multipletests_leave_one_out``, a leave-one-out sensitivity analysis
+  that recomputes a multiple testing correction after removing each
+  hypothesis in turn and reports which conclusions change relative to the
+  full family.
 
 .. rubric:: Performance
 
